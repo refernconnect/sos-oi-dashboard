@@ -84,10 +84,24 @@ class NSEFetcher:
 nse = NSEFetcher()
 
 # ─── DATA CACHE ───
-cache = {
-    "NIFTY": {"data": None, "timestamp": None, "error": None},
-    "BANKNIFTY": {"data": None, "timestamp": None, "error": None},
+SYMBOLS = {
+    "NIFTY":      {"type": "index", "step": 50},
+    "BANKNIFTY":  {"type": "index", "step": 100},
+    "FINNIFTY":   {"type": "index", "step": 50},
+    "MIDCPNIFTY": {"type": "index", "step": 25},
+    "SENSEX":     {"type": "index", "step": 100},
+    "RELIANCE":   {"type": "equity", "step": 20},
+    "HDFCBANK":   {"type": "equity", "step": 20},
+    "INFY":       {"type": "equity", "step": 20},
+    "TCS":        {"type": "equity", "step": 50},
+    "ICICIBANK":  {"type": "equity", "step": 20},
+    "SBIN":       {"type": "equity", "step": 10},
+    "TATAMOTORS": {"type": "equity", "step": 10},
+    "BAJFINANCE": {"type": "equity", "step": 100},
+    "ITC":        {"type": "equity", "step": 10},
+    "TATASTEEL":  {"type": "equity", "step": 5},
 }
+cache = {sym: {"data": None, "timestamp": None, "error": None} for sym in SYMBOLS}
 cache_lock = threading.Lock()
 
 
@@ -105,7 +119,7 @@ def process_chain(raw, symbol):
     # Filter to nearest expiry
     filtered = [d for d in data if d.get("expiryDate") == nearest_expiry]
 
-    step = 100 if symbol == "BANKNIFTY" else 50
+    step = SYMBOLS.get(symbol, {}).get("step", 50)
     atm = round(spot / step) * step
 
     strikes = []
@@ -248,7 +262,7 @@ def compute_max_pain(data):
 def refresh_data():
     """Background thread: fetch and cache data every 3 min."""
     while True:
-        for sym in ("NIFTY", "BANKNIFTY"):
+        for sym in SYMBOLS:
             try:
                 raw = nse.fetch_option_chain(sym)
                 if raw:
@@ -324,6 +338,7 @@ body {
     display: flex;
     gap: 4px;
     margin-bottom: 8px;
+    flex-wrap: wrap;
 }
 .tab {
     padding: 6px 16px;
@@ -454,8 +469,21 @@ tr.atm-row td.strike-col { background: #C4A882; color: #1A1816; }
     <span class="refresh-info" id="ts">loading...</span>
 </div>
 <div class="tabs">
-    <div class="tab active" onclick="switchTab('NIFTY')">NIFTY</div>
-    <div class="tab" onclick="switchTab('BANKNIFTY')">BANKNIFTY</div>
+  <div class="tab active" onclick="switchTab('NIFTY')">NIFTY</div>
+    <div class="tab" onclick="switchTab('BANKNIFTY')">BNIFTY</div>
+    <div class="tab" onclick="switchTab('FINNIFTY')">FINNIFTY</div>
+    <div class="tab" onclick="switchTab('RELIANCE')">RIL</div>
+    <div class="tab" onclick="switchTab('HDFCBANK')">HDFC</div>
+    <div class="tab" onclick="switchTab('INFY')">INFY</div>
+    <div class="tab" onclick="switchTab('TCS')">TCS</div>
+    <div class="tab" onclick="switchTab('ICICIBANK')">ICICI</div>
+    <div class="tab" onclick="switchTab('SBIN')">SBIN</div>
+    <div class="tab" onclick="switchTab('TATAMOTORS')">TATAMTR</div>
+    <div class="tab" onclick="switchTab('BAJFINANCE')">BAJFIN</div>
+    <div class="tab" onclick="switchTab('ITC')">ITC</div>
+    <div class="tab" onclick="switchTab('TATASTEEL')">TSTEEL</div>
+    <div class="tab" onclick="switchTab('MIDCPNIFTY')">MIDCP</div>
+    <div class="tab" onclick="switchTab('SENSEX')">SENSEX</div>
 </div>
 <div id="content"><div class="loading">Fetching NSE data...</div></div>
 
