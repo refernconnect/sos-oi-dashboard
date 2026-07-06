@@ -302,6 +302,81 @@ def api_data():
 def health():
     return "ok"
 
+@app.route("/api/confirm", methods=["POST"])
+def api_confirm():
+    from flask import request
+    payload = request.get_json(force=True, silent=True) or {}
+    symbol = payload.get("symbol", "NIFTY").upper()
+    direction = payload.get("direction", "").upper()
+    strike = payload.get("strike")
+
+    with cache_lock:
+        entry = cache.get(symbol, {})
+        data = entry.get("data")
+        ts = entry.get("timestamp")
+
+    if not data:
+        return jsonify({
+            "verdict": "NO_DATA",
+            "reason": f"No OI data available for {symbol}",
+            "timestamp": ts,
+        })
+
+    pcr = data["pcr"]
+    signal = data["signal"]
+    ce_wall = data["ce_wall"]
+    pe_wall = data["pe_wall"]
+    max_pain = data["max_pain"]
+    spot = data["spot"]
+
+    confirmed = None
+    reason = ""
+
+    if direction == "CE":
+        if "BEARISH" in signal:
+            confirmed = False
+            reason = f"OI signal is {signal} against a CE entry"
+        elif pcr < 0.7:
+            confirmed = False
+            reason = f"PCR {pcr} shows CE-heavy writing, against CE buy"
+        elif strike and ce_wall and strike >= ce_wall:
+            confirmed = False
+            reason = f"Strike {strike} at/above CE wall {ce_wall} (resistance)"
+        else:
+            confirmed = True
+            reason = f"OI signal {signal}, PCR {pcr} does not contradict CE"
+
+    elif direction == "PE":
+        if "BULLISH" in signal:
+            confirmed = False
+            reason = f"OI signal is {signal} against a PE entry"
+        elif pcr > 1.3:
+            confirmed = False
+            reason = f"PCR {pcr} shows PE-heavy writing, against PE buy"
+        elif strike and pe_wall and strike <= pe_wall:
+            confirmed = False
+            reason = f"Strike {strike} at/below PE wall {pe_wall} (support)"
+        else:
+            confirmed = True
+            reason = f"OI signal {signal}, PCR {pcr} does not contradict PE"
+
+    else:
+        return jsonify({"verdict": "INVALID", "reason": "direction must be CE or PE"})
+
+    return jsonify({
+        "verdict": "CONFIRMED" if confirmed else "CONFLICT",
+        "reason": reason,
+        "symbol": symbol,
+        "direction": direction,
+        "strike": strike,
+        "spot": spot,
+        "pcr": pcr,
+        "oi_signal": signal,
+        "ce_wall": ce_wall,
+        "pe_wall": pe_wall,
+        "max_pain": max_pain,
+        "data_timestamp": ts,
+    })
 
 # ─── DASHBOARD HTML ───
 DASHBOARD_HTML = """
