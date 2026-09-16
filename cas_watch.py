@@ -22,6 +22,7 @@ import os
 import sys
 import time
 import logging
+import threading
 import datetime as dt
 from email.utils import parsedate_to_datetime
 
@@ -351,6 +352,233 @@ def run_window(conn, session, end_dt):
     return session
 
 
+# ======================================================================
+# OPTION-CHAIN RECORDER (v2) - runs as a daemon thread beside the CAS loop
+# ----------------------------------------------------------------------
+# Purpose: forward-record the Nifty option chain (LTP, bid/ask, IV, OI) plus
+# India VIX at the two timestamps the overnight short-vol study needs
+# (~09:20 and ~15:20), and densely through 15:09-15:41 so the post-CAS
+# option repricing window is captured. Kite serves no history for expired
+# contracts, so this is the only way this data ever exists.
+#
+# Fully isolated: own NSE session, own DB connection, every step wrapped.
+# A failure here can never stop CAS logging.
+#
+# Env:
+#   CHAIN_ENABLED     (default 1)
+#   CHAIN_SYMBOLS     (default NIFTY)   comma list, e.g. NIFTY,BANKNIFTY
+#   CHAIN_HOT_SECS    (default 20)      cadence inside hot windows
+#   CHAIN_WARM_SECS   (default 300)     cadence 09:31-15:09
+#   CHAIN_STRIKES     (default 20)      strikes each side of ATM
+#   CHAIN_EXPIRIES    (default 3)       nearest expiries kept
+# ======================================================================
+
+CHAIN_ENABLED = os.getenv("CHAIN_ENABLED", "1") == "1"
+CHAIN_SYMBOLS = [s.strip().upper() for s in os.getenv("CHAIN_SYMBOLS", "NIFTY").split(",") if s.strip()]
+CHAIN_HOT_SECS = float(os.getenv("CHAIN_HOT_SECS", "20"))
+CHAIN_WARM_SECS = float(os.getenv("CHAIN_WARM_SECS", "300"))
+CHAIN_STRIKES = int(os.getenv("CHAIN_STRIKES", "20"))
+CHAIN_EXPIRIES = int(os.getenv("CHAIN_EXPIRIES", "3"))
+CHAIN_PAGE = "https://www.nseindia.com/option-chain"
+CHAIN_API = "https://www.nseindia.com/api/option-chain-indices?symbol={sym}"
+INDICES_API = "https://www.nseindia.com/api/allIndices"
+STRIKE_STEP = {"NIFTY": 50, "BANKNIFTY": 100, "FINNIFTY": 50, "MIDCPNIFTY": 25}
+# (start, end) IST windows polled at CHAIN_HOT_SECS; everything between the
+# first start and last end is polled at CHAIN_WARM_SECS
+CHAIN_HOT = [("09:14", "09:31"), ("15:09", "15:41")]
+
+CHAIN_DDL = """
+CREATE TABLE IF NOT EXISTS oc_meta (
+    snap_ts      timestamptz NOT NULL,
+    symbol       text        NOT NULL,
+    underlying   numeric,
+    atm_strike   numeric,
+    india_vix    numeric,
+    expiries     text[],
+    rows_written integer,
+    PRIMARY KEY (snap_ts, symbol)
+);
+CREATE TABLE IF NOT EXISTS oc_chain (
+    snap_ts   timestamptz NOT NULL,
+    symbol    text        NOT NULL,
+    expiry    date        NOT NULL,
+    strike    numeric     NOT NULL,
+    ce_ltp numeric, ce_bid numeric, ce_ask numeric, ce_iv numeric,
+    ce_oi bigint, ce_oi_chg bigint, ce_vol bigint,
+    pe_ltp numeric, pe_bid numeric, pe_ask numeric, pe_iv numeric,
+    pe_oi bigint, pe_oi_chg bigint, pe_vol bigint,
+    PRIMARY KEY (snap_ts, symbol, expiry, strike)
+);
+CREATE INDEX IF NOT EXISTS oc_chain_sym_exp_ts ON oc_chain (symbol, expiry, snap_ts);
+"""
+
+
+def chain_session():
+    s = requests.Session()
+    s.headers.update(BROWSER_HEADERS)
+    s.get(NSE_HOME, timeout=15)
+    s.get(CHAIN_PAGE, timeout=15)
+    log.info("[chain] nse session primed (%d cookies)", len(s.cookies))
+    return s
+
+
+def _num(x):
+    try:
+        if x is None or x == "" or x == "-":
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+
+def _int(x):
+    v = _num(x)
+    return int(v) if v is not None else None
+
+
+def parse_expiry(s):
+    for fmt in ("%d-%b-%Y", "%d-%b-%y", "%Y-%m-%d"):
+        try:
+            return dt.datetime.strptime(s, fmt).date()
+        except Exception:
+            pass
+    return None
+
+
+def fetch_vix(session):
+    try:
+        r = session.get(INDICES_API, headers={"Referer": CHAIN_PAGE,
+                                              "X-Requested-With": "XMLHttpRequest"}, timeout=15)
+        for row in (r.json().get("data") or []):
+            if (row.get("index") or "").upper().replace(" ", "") == "INDIAVIX":
+                return _num(row.get("last"))
+    except Exception as e:
+        log.debug("[chain] vix fetch failed: %s", e)
+    return None
+
+
+def fetch_chain(session, sym):
+    r = session.get(CHAIN_API.format(sym=sym),
+                    headers={"Referer": CHAIN_PAGE, "X-Requested-With": "XMLHttpRequest"},
+                    timeout=20)
+    if r.status_code != 200:
+        raise RuntimeError("chain %s http %s" % (sym, r.status_code))
+    j = r.json()
+    rec = j.get("records") or {}
+    data = rec.get("data") or []
+    under = _num(rec.get("underlyingValue"))
+    if not data or under is None:
+        raise RuntimeError("chain %s empty" % sym)
+    return under, data
+
+
+def build_rows(sym, under, data, snap_ts):
+    step = STRIKE_STEP.get(sym, 50)
+    atm = round(under / step) * step
+    lo, hi = atm - CHAIN_STRIKES * step, atm + CHAIN_STRIKES * step
+    exps = sorted({parse_expiry(d.get("expiryDate")) for d in data if d.get("expiryDate")} - {None})
+    keep = set(exps[:CHAIN_EXPIRIES])
+    rows = []
+    for d in data:
+        e = parse_expiry(d.get("expiryDate") or "")
+        k = _num(d.get("strikePrice"))
+        if e not in keep or k is None or k < lo or k > hi:
+            continue
+        ce, pe = d.get("CE") or {}, d.get("PE") or {}
+        rows.append((
+            snap_ts, sym, e, k,
+            _num(ce.get("lastPrice")), _num(ce.get("bidprice")), _num(ce.get("askPrice")),
+            _num(ce.get("impliedVolatility")), _int(ce.get("openInterest")),
+            _int(ce.get("changeinOpenInterest")), _int(ce.get("totalTradedVolume")),
+            _num(pe.get("lastPrice")), _num(pe.get("bidprice")), _num(pe.get("askPrice")),
+            _num(pe.get("impliedVolatility")), _int(pe.get("openInterest")),
+            _int(pe.get("changeinOpenInterest")), _int(pe.get("totalTradedVolume")),
+        ))
+    return atm, [str(e) for e in sorted(keep)], rows
+
+
+def persist_chain(conn, sym, under, atm, vix, exps, rows, snap_ts):
+    with conn.cursor() as cur:
+        if rows:
+            execute_values(cur, """
+                INSERT INTO oc_chain (snap_ts, symbol, expiry, strike,
+                    ce_ltp, ce_bid, ce_ask, ce_iv, ce_oi, ce_oi_chg, ce_vol,
+                    pe_ltp, pe_bid, pe_ask, pe_iv, pe_oi, pe_oi_chg, pe_vol)
+                VALUES %s ON CONFLICT DO NOTHING""", rows, page_size=500)
+        cur.execute("""
+            INSERT INTO oc_meta (snap_ts, symbol, underlying, atm_strike, india_vix, expiries, rows_written)
+            VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING""",
+            (snap_ts, sym, under, atm, vix, exps, len(rows)))
+
+
+def chain_cadence(now):
+    """Seconds to sleep, or None when outside the recording day."""
+    hm = now.strftime("%H:%M")
+    for a, b in CHAIN_HOT:
+        if a <= hm <= b:
+            return CHAIN_HOT_SECS
+    if CHAIN_HOT[0][0] <= hm <= CHAIN_HOT[-1][1]:
+        return CHAIN_WARM_SECS
+    return None
+
+
+def chain_loop():
+    log.info("[chain] recorder starting: symbols=%s hot=%ss warm=%ss strikes=+-%d expiries=%d",
+             CHAIN_SYMBOLS, CHAIN_HOT_SECS, CHAIN_WARM_SECS, CHAIN_STRIKES, CHAIN_EXPIRIES)
+    conn = None
+    session = None
+    primed_at = 0.0
+    while True:
+        try:
+            if conn is None:
+                conn = psycopg2.connect(DATABASE_URL)
+                conn.autocommit = True
+                with conn.cursor() as cur:
+                    cur.execute(CHAIN_DDL)
+                log.info("[chain] db ready")
+            now = now_ist()
+            if now.weekday() >= 5:
+                time.sleep(IDLE_SLEEP_MAX)
+                continue
+            cad = chain_cadence(now)
+            if cad is None:
+                start_dt = hhmm_today(now, CHAIN_HOT[0][0])
+                if now < start_dt:
+                    wait = (start_dt - now).total_seconds()
+                else:
+                    tomorrow = (now + dt.timedelta(days=1)).replace(hour=0, minute=1, second=0, microsecond=0)
+                    wait = (tomorrow - now).total_seconds()
+                time.sleep(max(5.0, min(wait, IDLE_SLEEP_MAX)))
+                continue
+            if session is None or time.time() - primed_at > COOKIE_MAX_AGE:
+                session = chain_session()
+                primed_at = time.time()
+            snap_ts = now.replace(microsecond=0)
+            vix = fetch_vix(session)
+            for sym in CHAIN_SYMBOLS:
+                try:
+                    under, data = fetch_chain(session, sym)
+                    atm, exps, rows = build_rows(sym, under, data, snap_ts)
+                    persist_chain(conn, sym, under, atm, vix, exps, rows, snap_ts)
+                    log.info("[chain] %s %s spot=%.1f atm=%d vix=%s rows=%d exps=%s",
+                             snap_ts.strftime("%H:%M:%S"), sym, under, atm, vix, len(rows), exps)
+                except Exception as e:
+                    log.warning("[chain] %s snapshot failed: %s", sym, e)
+                    session = None          # force re-prime next pass
+            time.sleep(cad)
+        except Exception as e:
+            log.exception("[chain] loop error: %s", e)
+            try:
+                if conn is not None:
+                    conn.close()
+            except Exception:
+                pass
+            conn = None
+            session = None
+            time.sleep(30)
+
+
+
 def main():
     log.info("cas_watch starting (poll=%.1fs window=%s-%s IST)",
              POLL_SECONDS, WINDOW_START, WINDOW_END)
@@ -358,6 +586,10 @@ def main():
     conn = connect_db()
     session = new_session()
     sync_clock(session)
+    if CHAIN_ENABLED:
+        threading.Thread(target=chain_loop, name="chain", daemon=True).start()
+    else:
+        log.info("[chain] disabled via CHAIN_ENABLED=0")
 
     while True:
         try:
