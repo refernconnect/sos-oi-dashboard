@@ -13,6 +13,10 @@ from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, render_template_string
 
 import requests
+try:
+    import psycopg2
+except Exception:
+    psycopg2 = None
 
 app = Flask(__name__)
 
@@ -296,6 +300,48 @@ def dashboard():
 def api_data():
     with cache_lock:
         return jsonify(cache)
+
+
+
+@app.route("/oc_count")
+def oc_count():
+    """Row counts + last timestamp for the option-chain recorder tables.
+    Confirms cas_watch v2 is actually writing. IST timestamps."""
+    if psycopg2 is None:
+        return jsonify({"error": "psycopg2 not installed"}), 500
+    url = os.getenv("DATABASE_URL")
+    if not url:
+        return jsonify({"error": "DATABASE_URL not set on this service"}), 500
+    out = {}
+    try:
+        conn = psycopg2.connect(url)
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            for tbl in ("oc_meta", "oc_chain", "cas_snapshots"):
+                try:
+                    cur.execute("SELECT count(*), max(snap_ts) FROM " + tbl)
+                    n, last = cur.fetchone()
+                    ist = None
+                    if last is not None:
+                        ist = (last.astimezone(timezone(timedelta(hours=5, minutes=30)))
+                               .strftime("%Y-%m-%d %H:%M:%S IST"))
+                    out[tbl] = {"rows": n, "last": ist}
+                except Exception as e:
+                    out[tbl] = {"error": str(e)[:120]}
+            try:
+                cur.execute("SELECT symbol, count(*) FROM oc_chain GROUP BY symbol ORDER BY 2 DESC")
+                out["oc_chain_by_symbol"] = {r[0]: r[1] for r in cur.fetchall()}
+            except Exception:
+                pass
+            try:
+                cur.execute("SELECT count(DISTINCT snap_ts::date) FROM oc_chain")
+                out["oc_chain_distinct_days"] = cur.fetchone()[0]
+            except Exception:
+                pass
+        conn.close()
+    except Exception as e:
+        return jsonify({"error": "db connect: " + str(e)[:200]}), 500
+    return jsonify(out)
 
 
 @app.route("/health")
